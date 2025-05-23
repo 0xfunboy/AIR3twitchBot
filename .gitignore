@@ -1,0 +1,63 @@
+###############################################################################
+#  Core Node.js / TypeScript
+###############################################################################
+# Dipendenze installate
+node_modules/
+
+# Output di compilazione / bundler
+dist/
+build/
+coverage/
+*.js
+*.js.map
+*.d.ts
+*.tsbuildinfo
+
+###############################################################################
+# File log and diagn
+###############################################################################
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+bot.log               # log runtime Relay-bot
+*.log
+
+###############################################################################
+# Config e segreti 
+###############################################################################
+.env
+.envrc
+*.chatbot.json
+*.local.json
+*.secret.*
+*.key
+*.pem
+
+###############################################################################
+# Strumenti vari
+###############################################################################
+# TypeScript server, ESLint, Prettier, ecc.
+.eslintcache
+.prettier-cache/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.log?
+
+# macOS / Windows detriti
+.DS_Store
+Thumbs.db
+Icon?
+
+###############################################################################
+# Docker / CI artefacts
+###############################################################################
+docker-compose.override.yml
+*.iml
