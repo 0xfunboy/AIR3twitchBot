@@ -28,7 +28,7 @@ bot.log               # log runtime Relay-bot
 ###############################################################################
 *.env
 .envrc
-*.chatbot.config.json
+chatbot.config.json
 *.local.json
 *.secret.*
 *.key
