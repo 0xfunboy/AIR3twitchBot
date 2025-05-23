@@ -1,0 +1,20 @@
+{
+  "twitch": {
+    "bot1": {
+      "clientId": "",
+      "clientSecret": "",
+      "refreshToken": "",
+      "oauthToken": "",
+      "channelUserId": "",
+      "botUserId": ""
+    },
+    "bot2": {
+      "clientId": "",
+      "clientSecret": "",
+      "refreshToken": "",
+      "oauthToken": "",
+      "channelUserId": "",
+      "botUserId": ""
+    }
+  }
+}
