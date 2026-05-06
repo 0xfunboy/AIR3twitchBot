@@ -1,37 +1,42 @@
 import fetch from "node-fetch";
 import { log } from "./logger";
 
-const COINGECKO_API_BASE_URL = "https://api.coingecko.com/api/v3";
-const COINGECKO_PRO_API_BASE_URL = "https://pro-api.coingecko.com/api/v3";
+const CMC_API_BASE_URL = "https://pro-api.coinmarketcap.com/v1";
 const DEXSCREENER_API_BASE_URL = "https://api.dexscreener.com";
 
-const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
+const CMC_API_KEY = process.env.CMC_API_KEY;
 
-interface CoinGeckoTrendingCoinItem {
-  id: string;
-  coin_id: number; // Not directly used, but part of response
+interface CmcListingItem {
+  id: number;
   name: string;
-  symbol: string; // This is what we primarily want (e.g., "BTC")
-  market_cap_rank: number | null;
-  thumb: string;
-  small: string;
-  large: string;
+  symbol: string;
   slug: string;
-  price_btc: number;
-  score: number; // Indicates trending rank
+  cmc_rank: number;
+  quote?: {
+    USD?: {
+      price: number;
+      volume_24h: number;
+      market_cap: number;
+      percent_change_24h: number;
+    }
+  }
 }
 
-interface CoinGeckoTrendingResponse {
-  coins: { item: CoinGeckoTrendingCoinItem }[]; // API nests the coin item under "item"
-  nfts: any[]; // Ignoring NFTs for now
-  categories: any[]; // Ignoring categories for now
+interface CmcListingsResponse {
+  status: {
+    timestamp: string;
+    error_code: number;
+    error_message: string | null;
+    elapsed: number;
+    credit_count: number;
+  };
+  data: CmcListingItem[];
 }
 
 interface DexScreenerBoost {
   url: string;
   chainId: string;
   tokenAddress: string; // This is what we need
-  // ... other fields we might ignore for now
 }
 
 interface DexScreenerTopBoostsResponse {
@@ -39,68 +44,85 @@ interface DexScreenerTopBoostsResponse {
   boosts: DexScreenerBoost[];
 }
 
-
 /**
- * Fetches trending coins from CoinGecko.
- * @returns A promise that resolves to an array of trending coin symbols (e.g., ["BTC", "ETH"]) or an empty array on error.
+ * Fetch “trending” symbols via CoinMarketCap FREE plan.
+ * We approximate trending using top market-cap listings (free endpoint):
+ *   /v1/cryptocurrency/listings/latest?limit=50&convert=USD
+ * Returns an array of symbols (e.g., ["BTC", "ETH", ...]).
  */
-export async function getTrendingCoinGeckoSymbols(): Promise<string[]> {
-  const endpoint = "/search/trending";
-  const baseUrl = COINGECKO_API_KEY ? COINGECKO_PRO_API_BASE_URL : COINGECKO_API_BASE_URL;
-  const url = `${baseUrl}${endpoint}`;
-  
-  const headers: { [key: string]: string } = { accept: 'application/json' };
-  if (COINGECKO_API_KEY) {
-    headers["x-cg-pro-api-key"] = COINGECKO_API_KEY;
+export async function getTrendingCoinMarketCapSymbols(limit: number = 50): Promise<string[]> {
+  if (!CMC_API_KEY) {
+    log("[ERR] [CryptoAPI] Missing CMC_API_KEY in environment.");
+    return [];
   }
 
+  const params = new URLSearchParams({
+    limit: String(limit),
+    convert: "USD",
+    sort: "market_cap",
+    cryptocurrency_type: "coins",
+  });
+
+  const url = `${CMC_API_BASE_URL}/cryptocurrency/listings/latest?${params.toString()}`;
+
   try {
-    log(`[CryptoAPI] Fetching trending coins from CoinGecko (${url})...`);
-    const response = await fetch(url, { headers });
+    log(`[CryptoAPI] Fetching listings from CoinMarketCap (FREE) -> ${url}`);
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "X-CMC_PRO_API_KEY": CMC_API_KEY,
+      },
+    });
+
     if (!response.ok) {
       const errorText = await response.text();
-      log(`[ERR] [CryptoAPI] Failed to fetch trending from CoinGecko (status ${response.status}): ${errorText}`);
+      log(`[ERR] [CryptoAPI] CoinMarketCap listings failed (status ${response.status}): ${errorText}`);
       return [];
     }
-    const data = (await response.json()) as CoinGeckoTrendingResponse;
-    if (data && data.coins) {
-      const symbols = data.coins.map(coinWrapper => coinWrapper.item.symbol.toUpperCase());
-      log(`[CryptoAPI] Successfully fetched ${symbols.length} trending CoinGecko symbols: ${symbols.join(', ')}`);
-      return symbols;
+
+    const data = (await response.json()) as CmcListingsResponse;
+    if (!data?.data || !Array.isArray(data.data)) {
+      log("[WARN] [CryptoAPI] CoinMarketCap response missing 'data' array.");
+      return [];
     }
-    log("[WARN] [CryptoAPI] No coins found in CoinGecko trending response.");
-    return [];
+
+    // Map to uppercase symbols; optionally filter out obvious stablecoins if vuoi.
+    const symbols = data.data
+      .map(item => item.symbol?.toUpperCase())
+      .filter(Boolean) as string[];
+
+    log(`[CryptoAPI] Fetched ${symbols.length} symbols from CoinMarketCap: ${symbols.slice(0, 10).join(", ")}${symbols.length > 10 ? " ..." : ""}`);
+    return symbols;
   } catch (error) {
-    log(`[ERR] [CryptoAPI] Error fetching trending CoinGecko symbols: ${(error as Error).message}`);
+    log(`[ERR] [CryptoAPI] Error fetching CoinMarketCap listings: ${(error as Error).message}`);
     return [];
   }
 }
 
 /**
  * Fetches top boosted token addresses from DexScreener.
- * @returns A promise that resolves to an array of token addresses or an empty array on error.
+ * @returns An array of token addresses or an empty array on error.
  */
 export async function getTopBoostedDexScreenerAddresses(): Promise<string[]> {
-  const endpoint = "/token-boosts/top/v1"; // As per your request
+  const endpoint = "/token-boosts/top/v1";
   const url = `${DEXSCREENER_API_BASE_URL}${endpoint}`;
 
   try {
     log(`[CryptoAPI] Fetching top boosted tokens from DexScreener (${url})...`);
-    const response = await fetch(url, { headers: { accept: 'application/json' } });
+    const response = await fetch(url, { headers: { accept: "application/json" } });
     if (!response.ok) {
       const errorText = await response.text();
       log(`[ERR] [CryptoAPI] Failed to fetch from DexScreener (status ${response.status}): ${errorText}`);
       return [];
     }
-    const data = (await response.json()) as DexScreenerTopBoostsResponse; // Assuming this is the structure
-    
-    // Based on your example, the response is an array directly
-    // Let's adjust if the structure is actually { "boosts": [] }
+
+    const data = (await response.json()) as DexScreenerTopBoostsResponse | DexScreenerBoost[];
+
     let addresses: string[] = [];
-    if (data && Array.isArray(data)) { // If response is directly an array of boosts
-        addresses = (data as unknown as DexScreenerBoost[]).map(boost => boost.tokenAddress).filter(addr => !!addr);
-    } else if (data && data.boosts && Array.isArray(data.boosts)) { // If response is { "boosts": [...] }
-        addresses = data.boosts.map(boost => boost.tokenAddress).filter(addr => !!addr);
+    if (Array.isArray(data)) {
+      addresses = (data as DexScreenerBoost[]).map(b => b.tokenAddress).filter(Boolean);
+    } else if (data && Array.isArray((data as DexScreenerTopBoostsResponse).boosts)) {
+      addresses = (data as DexScreenerTopBoostsResponse).boosts.map(b => b.tokenAddress).filter(Boolean);
     }
 
     if (addresses.length > 0) {

@@ -6,7 +6,7 @@ import path from "path";
 import { TwitchClient, TwitchBotConfig } from "./utils/twitchAuth";
 import { QuestionService, TokenIdentifierType } from "./services/questionService";
 import { TokenStoreService } from "./services/tokenStoreService";
-import { getTrendingCoinGeckoSymbols, getTopBoostedDexScreenerAddresses } from "./utils/cryptoApi";
+import { getTrendingCoinMarketCapSymbols, getTopBoostedDexScreenerAddresses } from "./utils/cryptoApi";
 import { log, initLogger } from "./utils/logger";
 
 const CONFIG_PATH = path.resolve(process.cwd(), "chatbot.config.json");
@@ -18,7 +18,7 @@ interface AppConfig {
   };
 }
 
-function loadAppConfig(): AppConfig | null { /* ... (come prima) ... */ 
+function loadAppConfig(): AppConfig | null {
   try {
     if (!fs.existsSync(CONFIG_PATH)) {
       log(`[ERR] [Main] Configuration file not found at ${CONFIG_PATH}. Please create it.`);
@@ -27,8 +27,8 @@ function loadAppConfig(): AppConfig | null { /* ... (come prima) ... */
     const rawConfig = fs.readFileSync(CONFIG_PATH, "utf8");
     const config = JSON.parse(rawConfig) as AppConfig;
     if (!config.twitch || !config.twitch.bot1 || !config.twitch.bot2) {
-        log("[ERR] [Main] Invalid configuration structure in chatbot.config.json. Missing twitch.bot1 or twitch.bot2.");
-        return null;
+      log("[ERR] [Main] Invalid configuration structure in chatbot.config.json. Missing twitch.bot1 or twitch.bot2.");
+      return null;
     }
     return config;
   } catch (error) {
@@ -37,8 +37,8 @@ function loadAppConfig(): AppConfig | null { /* ... (come prima) ... */
   }
 }
 
-const DEXSCREENER_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // Refresh DexScreener list every 15 minutes
-let useDexScreenerNext = false; // Start with CoinGecko perhaps
+const DEXSCREENER_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+let useDexScreenerNext = false; // Alternate CMC <-> Dex
 
 async function main() {
   initLogger();
@@ -63,14 +63,30 @@ async function main() {
   const twitchBot2 = new TwitchClient(appConfig.twitch.bot2, "bot2");
   const bots: TwitchClient[] = [];
 
-  try { await twitchBot1.start(); bots.push(twitchBot1); } catch (e) { log(`[ERR] Failed to start Bot 1: ${(e as Error).message}`); }
-  try { await twitchBot2.start(); bots.push(twitchBot2); } catch (e) { log(`[ERR] Failed to start Bot 2: ${(e as Error).message}`); }
+  try { await twitchBot1.start(); bots.push(twitchBot1); } catch (e) { log(`[ERR] [Main] Failed to start Bot 1: ${(e as Error).message}`); }
+  try { await twitchBot2.start(); bots.push(twitchBot2); } catch (e) { log(`[ERR] [Main] Failed to start Bot 2: ${(e as Error).message}`); }
 
   if (bots.length === 0) {
     log("[FATAL] [Main] No Twitch bots started. Exiting.");
     process.exit(1);
   }
-  log(`[Main] ${bots.length} Twitch bot(s) initialized.`);
+
+  if (bots.length === 2) {
+    const b1 = bots[0], b2 = bots[1];
+    const id1 = b1.getUserId(), id2 = b2.getUserId();
+    log(`[Main] Bot identities -> ${b1.getIdentifier()} userId=${id1}, ${b2.getIdentifier()} userId=${id2}`);
+
+    if (!id1 || !id2) {
+      log("[FATAL] [Main] One of the bots does not have a userId after start(). Check tokens/scopes.");
+      process.exit(1);
+    }
+    if (id1 === id2) {
+      log("[FATAL] [Main] bot1 and bot2 share the SAME Twitch userId. Re-authorize using TWO different Twitch accounts (scope: user:write:chat).");
+      process.exit(1);
+    }
+  } else {
+    log(`[Main] ${bots.length} Twitch bot(s) initialized (not both). Round-robin will operate over the available bot(s).`);
+  }
 
   const questionService = new QuestionService();
   await questionService.loadQuestions();
@@ -86,10 +102,16 @@ async function main() {
       log("[MainLoop] No new tokens fetched from DexScreener this cycle.");
     }
   }
-  // Initial fetch and set up periodic refresh for DexScreener
   await refreshDexScreenerTokens();
   setInterval(refreshDexScreenerTokens, DEXSCREENER_REFRESH_INTERVAL_MS);
 
+  // ---- Round-robin across the available bots ----
+  let nextBotIndex = 0;
+  function pickNextBot(): TwitchClient {
+    const bot = bots[nextBotIndex];
+    nextBotIndex = (nextBotIndex + 1) % bots.length;
+    return bot;
+  }
 
   async function questionLoop() {
     let tokenInfo: { identifier: string; type: TokenIdentifierType } | undefined = undefined;
@@ -98,60 +120,58 @@ async function main() {
     try {
       const waitTimeMinutes = Math.random() * (deltaTMaxMinutes - deltaTMinMinutes) + deltaTMinMinutes;
       const waitTimeMs = waitTimeMinutes * 60 * 1000;
-      log(`[MainLoop] Next question in ${waitTimeMinutes.toFixed(2)} minutes. Alternating source: ${useDexScreenerNext ? 'DexScreener' : 'CoinGecko'}`);
+      log(`[MainLoop] Next question in ${waitTimeMinutes.toFixed(2)} minutes. Alternating source: ${useDexScreenerNext ? "DexScreener" : "CoinMarketCap"}`);
       await new Promise(resolve => setTimeout(resolve, waitTimeMs));
 
       if (useDexScreenerNext) {
         let dexTokenAddress = tokenStoreService.getNextContractAddress();
         if (!dexTokenAddress && tokenStoreService.getStoreSize() < tokenStoreService.getMinStoreThreshold()) {
-            log("[MainLoop] DexScreener store low/empty, attempting immediate refresh before selecting token...");
-            await refreshDexScreenerTokens(); // Try to refill
-            dexTokenAddress = tokenStoreService.getNextContractAddress();
+          log("[MainLoop] DexScreener store low/empty, attempting immediate refresh before selecting token...");
+          await refreshDexScreenerTokens();
+          dexTokenAddress = tokenStoreService.getNextContractAddress();
         }
 
         if (dexTokenAddress) {
           tokenInfo = { identifier: dexTokenAddress, type: "address" };
           log(`[MainLoop] Using DexScreener token: ${dexTokenAddress}`);
         } else {
-          log("[MainLoop] No DexScreener token available, falling back to CoinGecko for this turn.");
-          // Fallback to CoinGecko if DexScreener fails or has no tokens
-          const cgSymbols = await getTrendingCoinGeckoSymbols();
-          if (cgSymbols.length > 0) {
-            const symbol = cgSymbols[Math.floor(Math.random() * cgSymbols.length)];
+          log("[MainLoop] No DexScreener token available, falling back to CoinMarketCap for this turn.");
+          const cmcSymbols = await getTrendingCoinMarketCapSymbols(50);
+          if (cmcSymbols.length > 0) {
+            const symbol = cmcSymbols[Math.floor(Math.random() * cmcSymbols.length)];
             tokenInfo = { identifier: symbol, type: "ticker" };
-            log(`[MainLoop] Using CoinGecko token (fallback): $${symbol}`);
+            log(`[MainLoop] Using CoinMarketCap token (fallback): $${symbol}`);
           }
         }
-      } else { // Use CoinGecko
-        const cgSymbols = await getTrendingCoinGeckoSymbols();
-        if (cgSymbols.length > 0) {
-          const symbol = cgSymbols[Math.floor(Math.random() * cgSymbols.length)];
+      } else {
+        const cmcSymbols = await getTrendingCoinMarketCapSymbols(50);
+        if (cmcSymbols.length > 0) {
+          const symbol = cmcSymbols[Math.floor(Math.random() * cmcSymbols.length)];
           tokenInfo = { identifier: symbol, type: "ticker" };
-          log(`[MainLoop] Using CoinGecko token: $${symbol}`);
+          log(`[MainLoop] Using CoinMarketCap token: $${symbol}`);
         } else {
-            log("[MainLoop] No CoinGecko token available, trying DexScreener as fallback for this turn.");
-            let dexTokenAddress = tokenStoreService.getNextContractAddress();
-            if (dexTokenAddress) {
-                tokenInfo = { identifier: dexTokenAddress, type: "address" };
-                log(`[MainLoop] Using DexScreener token (fallback): ${dexTokenAddress}`);
-            }
+          log("[MainLoop] No CoinMarketCap symbols available, trying DexScreener as fallback for this turn.");
+          let dexTokenAddress = tokenStoreService.getNextContractAddress();
+          if (dexTokenAddress) {
+            tokenInfo = { identifier: dexTokenAddress, type: "address" };
+            log(`[MainLoop] Using DexScreener token (fallback): ${dexTokenAddress}`);
+          }
         }
       }
-      
+
       // Toggle for next iteration
       useDexScreenerNext = !useDexScreenerNext;
 
-      // Get question based on whether we have tokenInfo or not
+      // Build question
       question = await questionService.getFormattedQuestion(tokenInfo);
 
       if (question && bots.length > 0) {
-        const selectedBot = bots[Math.floor(Math.random() * bots.length)];
-        log(`[MainLoop] Selected bot (${selectedBot === twitchBot1 ? 'bot1' : 'bot2'}) to ask: "${question}"`);
+        const selectedBot = pickNextBot();
+        log(`[MainLoop] Sending with ${selectedBot.getIdentifier()} [userId=${selectedBot.getUserId()}] -> "${question}"`);
         await selectedBot.sendMessage(question);
       } else if (!question) {
         log("[MainLoop] No question generated. Skipping.");
       }
-
     } catch (error) {
       log(`[ERR] [MainLoop] Error: ${(error as Error).message}`);
     } finally {

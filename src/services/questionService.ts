@@ -14,17 +14,9 @@ export type TokenIdentifierType = "ticker" | "address";
 export class QuestionService {
   private questions: QuestionSet = {};
   private categories: string[] = [];
-  // Categories that require a token identifier (either ticker or address)
-  private categoriesRequiringToken: string[]; 
 
   constructor() {
-    this.categoriesRequiringToken = [
-        "GET_CRYPTO_ANALYSIS",
-        "GET_CRYPTO_PRICE",
-        "GET_TOKEN_ANALYSIS",
-        "GET_TOKEN_PRICE",
-        "GET_NEWS"
-    ];
+
   }
 
   async loadQuestions(): Promise<void> {
@@ -58,53 +50,71 @@ export class QuestionService {
       return null;
     }
 
-    let randomCategory = this.categories[Math.floor(Math.random() * this.categories.length)];
-    
-    // If tokenInfo is provided, try to pick a category that uses tokens.
-    // If not, or if it randomly picks one anyway, it will proceed.
-    // If tokenInfo is NOT provided, ensure we pick a category that DOESN'T require a token.
-    if (tokenInfo && !this.categoriesRequiringToken.includes(randomCategory)) {
-        // If we have a token but picked a general category, try to pick a token category
-        const tokenCategories = this.categories.filter(cat => this.categoriesRequiringToken.includes(cat));
-        if (tokenCategories.length > 0) {
-            randomCategory = tokenCategories[Math.floor(Math.random() * tokenCategories.length)];
-        }
-        // If still no suitable category, it might ask a general q with a token (which will be ignored by template)
-    } else if (!tokenInfo) {
-        // If we DON'T have a token, pick a category that doesn't need one
-        const generalCategories = this.categories.filter(cat => !this.categoriesRequiringToken.includes(cat));
-        if (generalCategories.length > 0) {
-            randomCategory = generalCategories[Math.floor(Math.random() * generalCategories.length)];
-        } else {
-            // All categories require a token, but we don't have one. This is a config issue.
-            log("[WARN] [QuestionService] No token provided, but all question categories require one. Check questions.json.");
-            return null;
-        }
+    const needsToken = (tpl: string) => tpl.includes("[TOKEN_IDENTIFIER]");
+    const agentTag = process.env.AGENT_NAME || "@bot_agent";
+
+    // Scegli una categoria che abbia almeno un template adatto al contesto (con/ senza token)
+    const categoryIsUsable = (cat: string) => {
+      const tpls = this.questions[cat] || [];
+      return tokenInfo ? tpls.some(needsToken) || tpls.length > 0
+        : tpls.some(t => !needsToken(t));
+    };
+
+    let candidateCategories = this.categories.filter(categoryIsUsable);
+    if (candidateCategories.length === 0) {
+      // Fallback estremo: usa comunque tutte
+      candidateCategories = this.categories.slice();
     }
 
+    // Pick casuale tra le candidate
+    let randomCategory = candidateCategories[Math.floor(Math.random() * candidateCategories.length)];
+    let templates = this.questions[randomCategory] || [];
 
-    const questionsInCategory = this.questions[randomCategory];
+    // Costruisci il pool di template adatto
+    let pool: string[] = [];
+    if (tokenInfo) {
+      pool = templates.filter(needsToken);
+      if (pool.length === 0) pool = templates.slice(); // fallback: anche senza token
+    } else {
+      pool = templates.filter(t => !needsToken(t));
+      if (pool.length === 0) {
+        // Se proprio non ci sono template senza token in questa categoria, prova un’altra candidata
+        const altCat = candidateCategories.find(cat => (this.questions[cat] || []).some(t => !needsToken(t)));
+        if (altCat) {
+          templates = this.questions[altCat] || [];
+          pool = templates.filter(t => !needsToken(t));
+        }
+      }
+    }
 
-    if (!questionsInCategory || questionsInCategory.length === 0) {
-      log(`[WARN] [QuestionService] No questions found in category: ${randomCategory}`);
+    if (pool.length === 0) {
+      log(`[WARN] [QuestionService] No suitable templates in category: ${randomCategory}`);
       return null;
     }
 
-    let questionTemplate = questionsInCategory[Math.floor(Math.random() * questionsInCategory.length)];
+    let questionTemplate = pool[Math.floor(Math.random() * pool.length)];
 
-    // Replace [AGENT_NAME] - only relevant for categories that use it (GENERAL_AGENT_QUERIES)
-    questionTemplate = questionTemplate.replace(/\[AGENT_NAME\]/g, AGENT_NAME);
+    // Sostituzione handle agente: supporta sia [AGENT_NAME] sia tag hardcoded
+    questionTemplate = questionTemplate
+      .replace(/\[AGENT_NAME\]/g, agentTag)
+      .replace(/@AIR3_Agent|@AIRewardrop/g, agentTag);
 
-    // Replace [TOKEN_IDENTIFIER] if tokenInfo is provided and category is appropriate
-    if (tokenInfo && this.categoriesRequiringToken.includes(randomCategory)) {
-      const displayIdentifier = tokenInfo.type === "ticker" ? `$${tokenInfo.identifier.toUpperCase()}` : tokenInfo.identifier;
-      questionTemplate = questionTemplate.replace(/\[TOKEN_IDENTIFIER\]/g, displayIdentifier);
-    } else {
-      // If category expected a token but none was given, or vice-versa, clean up any remaining placeholder
-      questionTemplate = questionTemplate.replace(/\[TOKEN_IDENTIFIER\]/g, "some hot coin"); // Fallback
+    // Sostituzione token (solo se il template lo richiede)
+    if (needsToken(questionTemplate)) {
+      if (tokenInfo) {
+        const display =
+          tokenInfo.type === "ticker"
+            ? `$${tokenInfo.identifier.toUpperCase()}`
+            : tokenInfo.identifier;
+        questionTemplate = questionTemplate.replace(/\[TOKEN_IDENTIFIER\]/g, display);
+      } else {
+        // Fallback sobrio quando manca il token
+        questionTemplate = questionTemplate.replace(/\[TOKEN_IDENTIFIER\]/g, "$BTC");
+      }
     }
-    
+
     log(`[QuestionService] Selected question: "${questionTemplate}" from category "${randomCategory}"`);
     return questionTemplate;
   }
+
 }

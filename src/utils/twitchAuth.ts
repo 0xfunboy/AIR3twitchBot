@@ -24,7 +24,6 @@ const chatbotConfigSchema = z.object({
 });
 type ChatbotConfig = z.infer<typeof chatbotConfigSchema>;
 
-
 interface OAuthResp {
   access_token?: string;
   refresh_token?: string;
@@ -45,11 +44,11 @@ export class TwitchClient {
   private cfg: TwitchBotConfig;
   private token = "";
   private userId = ""; // Bot's own user ID
-  private botIdentifier: string; // e.g., "bot1" or "bot2" for logging/config updates
+  private botIdentifier: "bot1" | "bot2"; // for logging/config updates
 
   constructor(rawConfig: unknown, botKey: string) {
     this.cfg = twitchBotConfigSchema.parse(rawConfig);
-    this.botIdentifier = botKey;
+    this.botIdentifier = (botKey === "bot2" ? "bot2" : "bot1");
     if (this.cfg.oauthToken) {
       this.token = this.cfg.oauthToken;
     }
@@ -64,9 +63,17 @@ export class TwitchClient {
   async start(): Promise<void> {
     log(`[TwitchClient-${this.botIdentifier}] Starting...`);
     await this.ensureToken();
-    this.startTokenRefreshTimer(); // Refreshes token well before expiry
+    this.startTokenRefreshTimer();   // Refreshes token well before expiry
     this.startTokenValidationTimer(); // Periodically validates token
-    log(`[TwitchClient-${this.botIdentifier}] Started successfully for bot ID ${this.userId} targeting channel ${this.cfg.channelUserId}.`);
+    log(`[TwitchClient-${this.botIdentifier}] Started successfully for bot userId=${this.userId} targeting channel ${this.cfg.channelUserId}.`);
+  }
+
+  /** Public getters for coordination/logging */
+  public getUserId(): string {
+    return this.userId;
+  }
+  public getIdentifier(): "bot1" | "bot2" {
+    return this.botIdentifier;
   }
 
   /**
@@ -108,52 +115,57 @@ export class TwitchClient {
       }
 
       this.token = j.access_token;
-      if (j.refresh_token) { // Twitch may return a new refresh token
+      if (j.refresh_token) {
+        // Twitch may return a new refresh token
         this.cfg.refreshToken = j.refresh_token;
       }
       log(`[TwitchClient-${this.botIdentifier}] Token refreshed successfully.`);
       await this.persistTokens();
     } catch (error) {
       log(`[ERR] [TwitchClient-${this.botIdentifier}] Token refresh error: ${(error as Error).message}`);
-      throw error; // Propagate error to allow for retry logic or shutdown
+      throw error; // Propagate error
     }
   }
 
   /**
-   * Validates the current OAuth token and updates botUserId.
+   * Validates the current OAuth token, checks scopes, and updates botUserId.
    */
   private async validateToken(): Promise<void> {
     log(`[TwitchClient-${this.botIdentifier}] Validating token...`);
     if (!this.token) {
-        log(`[WARN] [TwitchClient-${this.botIdentifier}] No token to validate. Attempting refresh first.`);
-        await this.refreshToken(); // This will throw if it fails
+      log(`[WARN] [TwitchClient-${this.botIdentifier}] No token to validate. Attempting refresh first.`);
+      await this.refreshToken(); // This will throw if it fails
     }
 
     try {
-      const r: FetchResponse = await fetch("https://id.twitch.tv/oauth2/validate", {
-        headers: { Authorization: `OAuth ${this.token}` },
-      });
-
-      if (!r.ok) {
-        const errorText = await r.text();
-        log(`[ERR] [TwitchClient-${this.botIdentifier}] Token validation failed (status ${r.status}): ${errorText}. Attempting refresh.`);
-        // If validation fails, token is likely expired or invalid
-        await this.refreshToken(); // Try to get a new token
-        // Re-validate after refresh
-        const r2 = await fetch("https://id.twitch.tv/oauth2/validate", {
-            headers: { Authorization: `OAuth ${this.token}` }
+      const doValidate = async () => {
+        const r = await fetch("https://id.twitch.tv/oauth2/validate", {
+          headers: { Authorization: `OAuth ${this.token}` },
         });
-        if (!r2.ok) {
-            throw new Error(`Token still invalid after refresh: ${await r2.text()}`);
+        if (!r.ok) {
+          throw new Error(`validate status ${r.status}: ${await r.text()}`);
         }
-        const data2 = (await r2.json()) as ValidateResp;
-        this.userId = data2.user_id;
-      } else {
-        const data = (await r.json()) as ValidateResp;
-        this.userId = data.user_id;
+        return (await r.json()) as ValidateResp;
+      };
+
+      let data: ValidateResp;
+      try {
+        data = await doValidate();
+      } catch (firstErr) {
+        log(`[WARN] [TwitchClient-${this.botIdentifier}] Validation failed, attempting refresh… (${(firstErr as Error).message})`);
+        await this.refreshToken();
+        data = await doValidate();
       }
-      
-      log(`[TwitchClient-${this.botIdentifier}] Token validated for user ID: ${this.userId}.`);
+
+      this.userId = data.user_id;
+      log(`[TwitchClient-${this.botIdentifier}] Token validated for userId=${this.userId}, login=${data.login}, scopes=[${data.scopes.join(", ")}]`);
+
+      // Ensure we have the scope needed to send chat messages
+      if (!data.scopes.includes("user:write:chat")) {
+        const msg = `Missing required scope "user:write:chat" for ${this.botIdentifier} (userId=${this.userId}). Re-authorize this bot with the correct scope.`;
+        log(`[FATAL] [TwitchClient-${this.botIdentifier}] ${msg}`);
+        throw new Error(msg);
+      }
 
       if (this.cfg.botUserId !== this.userId) {
         this.cfg.botUserId = this.userId;
@@ -196,7 +208,7 @@ export class TwitchClient {
     if (!this.userId) {
       log(`[WARN] [TwitchClient-${this.botIdentifier}] Bot User ID not set. Validating token first.`);
       await this.validateToken(); // Ensure userId is set
-      if(!this.userId) {
+      if (!this.userId) {
         log(`[ERR] [TwitchClient-${this.botIdentifier}] Cannot send message: Bot User ID still not set after validation.`);
         return;
       }
@@ -205,7 +217,7 @@ export class TwitchClient {
     const url = "https://api.twitch.tv/helix/chat/messages";
     const body = {
       broadcaster_id: this.cfg.channelUserId, // ID of the channel to send the message to
-      sender_id: this.userId, // ID of the user sending the message (the bot itself)
+      sender_id: this.userId,                 // ID of the user sending the message (the bot itself)
       message: text,
     };
 
@@ -226,7 +238,7 @@ export class TwitchClient {
           `[ERR] [TwitchClient-${this.botIdentifier}] sendMessage failed to channel ${this.cfg.channelUserId} (status ${r.status}): ${errorData}`
         );
       } else {
-        log(`[TwitchClient-${this.botIdentifier}] Message sent to channel ${this.cfg.channelUserId}: "${text}"`);
+        log(`[TwitchClient-${this.botIdentifier}] Message sent to channel ${this.cfg.channelUserId} by userId=${this.userId}: "${text}"`);
       }
     } catch (error) {
       log(`[ERR] [TwitchClient-${this.botIdentifier}] sendMessage error: ${(error as Error).message}`);
@@ -244,7 +256,7 @@ export class TwitchClient {
         log(`[ERR] [TwitchClient-${this.botIdentifier}] Scheduled token refresh failed: ${(e as Error).message}`)
       );
     }, refreshInterval);
-    log(`[TwitchClient-${this.botIdentifier}] Token auto-refresh scheduled every ${refreshInterval / (60*1000)} minutes.`);
+    log(`[TwitchClient-${this.botIdentifier}] Token auto-refresh scheduled every ${refreshInterval / (60 * 1000)} minutes.`);
   }
 
   /**
@@ -258,13 +270,13 @@ export class TwitchClient {
         log(`[WARN] [TwitchClient-${this.botIdentifier}] Scheduled token validation failed: ${(e as Error).message}. Attempting immediate refresh.`);
         // If validation fails, try to refresh immediately as the token might be compromised/expired
         try {
-            await this.refreshToken();
-            await this.validateToken(); // Re-validate after refresh
+          await this.refreshToken();
+          await this.validateToken(); // Re-validate after refresh
         } catch (refreshError) {
-            log(`[ERR] [TwitchClient-${this.botIdentifier}] Immediate refresh after validation failure also failed: ${(refreshError as Error).message}`);
+          log(`[ERR] [TwitchClient-${this.botIdentifier}] Immediate refresh after validation failure also failed: ${(refreshError as Error).message}`);
         }
       });
     }, validationInterval);
-     log(`[TwitchClient-${this.botIdentifier}] Token auto-validation scheduled every ${validationInterval / (60*1000)} minutes.`);
+    log(`[TwitchClient-${this.botIdentifier}] Token auto-validation scheduled every ${validationInterval / (60 * 1000)} minutes.`);
   }
 }
