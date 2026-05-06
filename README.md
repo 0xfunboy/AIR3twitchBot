@@ -1,10 +1,9 @@
-<<<<<<< HEAD
 # AIR3twitchBot-
-AIR³ Twitch Crypto Bot is a TypeScript-based Twitch bot that periodically asks crypto-related questions in your channel.
+AIR3 Twitch Crypto Bot is a TypeScript-based Twitch bot that periodically asks crypto-related questions in your channel.
 =======
-# AIR³ Twitch Crypto Bot
+# AIR3 Twitch Crypto Bot
 
-**AIR³ Twitch Crypto Bot** is a TypeScript-based Twitch bot that periodically asks crypto-related questions in your channel.  
+**AIR3 Twitch Crypto Bot** is a TypeScript-based Twitch bot that periodically asks crypto-related questions in your channel.  
 It supports dual Twitch accounts, configurable intervals, and pulls real-time data and analysis from CoinMarketCap & CoinGecko.
 
 
@@ -144,4 +143,3 @@ All your natural-language prompts live in `questions.json`. Example entry:
 ## License
 
 MIT © \ AIRewardrop
->>>>>>> 797c3a2 (Add README)

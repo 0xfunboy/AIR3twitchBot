@@ -61,3 +61,6 @@ Icon?
 ###############################################################################
 docker-compose.override.yml
 *.iml
+
+# Runtime discovered token cache
+discovered_dex_tokens.json
