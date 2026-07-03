@@ -4,12 +4,22 @@ dotenv.config();
 import fs from "fs";
 import path from "path";
 import { TwitchClient, TwitchBotConfig } from "./utils/twitchAuth";
-import { QuestionService, TokenIdentifierType } from "./services/questionService";
+import { QuestionService, QuestionTokenInfo } from "./services/questionService";
 import { TokenStoreService } from "./services/tokenStoreService";
-import { getTrendingCoinMarketCapSymbols, getTopBoostedDexScreenerAddresses } from "./utils/cryptoApi";
+import {
+  TokenCandidate,
+  getCoinMarketCapTokens,
+  getCoinGeckoTrendingTokens,
+  getTopBoostedDexScreenerAddresses,
+} from "./utils/cryptoApi";
 import { log, initLogger } from "./utils/logger";
 
 const CONFIG_PATH = path.resolve(process.cwd(), "chatbot.config.json");
+
+const DEXSCREENER_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const MARKET_DATA_CACHE_TTL_MS = 10 * 60 * 1000; // don't burn API credits every question
+const RECENT_TOKEN_MEMORY = 6; // don't ask about the same token twice in a row
+const TOKEN_PICK_ATTEMPTS = 10;
 
 interface AppConfig {
   twitch: {
@@ -37,12 +47,34 @@ function loadAppConfig(): AppConfig | null {
   }
 }
 
-const DEXSCREENER_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-let useDexScreenerNext = false; // Alternate CMC <-> Dex
+/** Cached market data so each question doesn't cost an API call. */
+class CandidateCache {
+  private candidates: TokenCandidate[] = [];
+  private fetchedAt = 0;
+
+  constructor(
+    private readonly label: string,
+    private readonly fetcher: () => Promise<TokenCandidate[]>
+  ) {}
+
+  async get(): Promise<TokenCandidate[]> {
+    const now = Date.now();
+    if (now - this.fetchedAt > MARKET_DATA_CACHE_TTL_MS) {
+      const fresh = await this.fetcher();
+      if (fresh.length > 0) {
+        this.candidates = fresh;
+        this.fetchedAt = now;
+      } else {
+        log(`[WARN] [Main] ${this.label} returned no candidates; keeping ${this.candidates.length} stale ones.`);
+      }
+    }
+    return this.candidates;
+  }
+}
 
 async function main() {
   initLogger();
-  log("[Main] Starting AIR3 Twitch Crypto Bro Bot...");
+  log("[Main] Starting AIR3 Twitch Crypto Bot...");
 
   const appConfig = loadAppConfig();
   if (!appConfig) {
@@ -93,6 +125,9 @@ async function main() {
 
   const tokenStoreService = new TokenStoreService();
 
+  const cmcCache = new CandidateCache("CoinMarketCap", () => getCoinMarketCapTokens(50));
+  const coingeckoCache = new CandidateCache("CoinGecko trending", () => getCoinGeckoTrendingTokens());
+
   async function refreshDexScreenerTokens() {
     log("[MainLoop] Refreshing DexScreener token list...");
     const newAddresses = await getTopBoostedDexScreenerAddresses();
@@ -105,6 +140,56 @@ async function main() {
   await refreshDexScreenerTokens();
   setInterval(refreshDexScreenerTokens, DEXSCREENER_REFRESH_INTERVAL_MS);
 
+  // ---- Token sources, rotated per question with fallback to the others ----
+  type SourceName = "coingecko" | "coinmarketcap" | "dexscreener";
+  const sourceCycle: SourceName[] = ["coingecko", "coinmarketcap", "dexscreener"];
+  let sourceIndex = 0;
+  const recentTokens: string[] = [];
+
+  function rememberToken(identifier: string) {
+    recentTokens.push(identifier.toUpperCase());
+    if (recentTokens.length > RECENT_TOKEN_MEMORY) recentTokens.shift();
+  }
+
+  function pickFresh(candidates: TokenCandidate[]): TokenCandidate | null {
+    if (candidates.length === 0) return null;
+    for (let i = 0; i < TOKEN_PICK_ATTEMPTS; i++) {
+      const candidate = candidates[Math.floor(Math.random() * candidates.length)];
+      if (!recentTokens.includes(candidate.identifier.toUpperCase())) return candidate;
+    }
+    return candidates[Math.floor(Math.random() * candidates.length)];
+  }
+
+  async function candidatesFrom(source: SourceName): Promise<TokenCandidate[]> {
+    switch (source) {
+      case "coingecko":
+        return coingeckoCache.get();
+      case "coinmarketcap":
+        return cmcCache.get();
+      case "dexscreener": {
+        if (tokenStoreService.getStoreSize() < tokenStoreService.getMinStoreThreshold()) {
+          await refreshDexScreenerTokens();
+        }
+        const address = tokenStoreService.getNextContractAddress();
+        return address ? [{ identifier: address, type: "address", source: "dexscreener" }] : [];
+      }
+    }
+  }
+
+  async function pickNextToken(): Promise<TokenCandidate | null> {
+    // Start from the scheduled source, fall back through the rest
+    for (let i = 0; i < sourceCycle.length; i++) {
+      const source = sourceCycle[(sourceIndex + i) % sourceCycle.length];
+      const candidate = pickFresh(await candidatesFrom(source));
+      if (candidate) {
+        sourceIndex = (sourceIndex + i + 1) % sourceCycle.length;
+        log(`[MainLoop] Token from ${source}: ${candidate.identifier}${candidate.change24h !== undefined ? ` (24h ${candidate.change24h.toFixed(1)}%)` : ""}`);
+        return candidate;
+      }
+    }
+    return null;
+  }
+
   // ---- Round-robin across the available bots ----
   let nextBotIndex = 0;
   function pickNextBot(): TwitchClient {
@@ -114,56 +199,29 @@ async function main() {
   }
 
   async function questionLoop() {
-    let tokenInfo: { identifier: string; type: TokenIdentifierType } | undefined = undefined;
-    let question: string | null = null;
-
     try {
       const waitTimeMinutes = Math.random() * (deltaTMaxMinutes - deltaTMinMinutes) + deltaTMinMinutes;
-      const waitTimeMs = waitTimeMinutes * 60 * 1000;
-      log(`[MainLoop] Next question in ${waitTimeMinutes.toFixed(2)} minutes. Alternating source: ${useDexScreenerNext ? "DexScreener" : "CoinMarketCap"}`);
-      await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+      log(`[MainLoop] Next question in ${waitTimeMinutes.toFixed(2)} minutes.`);
+      await new Promise(resolve => setTimeout(resolve, waitTimeMinutes * 60 * 1000));
 
-      if (useDexScreenerNext) {
-        let dexTokenAddress = tokenStoreService.getNextContractAddress();
-        if (!dexTokenAddress && tokenStoreService.getStoreSize() < tokenStoreService.getMinStoreThreshold()) {
-          log("[MainLoop] DexScreener store low/empty, attempting immediate refresh before selecting token...");
-          await refreshDexScreenerTokens();
-          dexTokenAddress = tokenStoreService.getNextContractAddress();
-        }
-
-        if (dexTokenAddress) {
-          tokenInfo = { identifier: dexTokenAddress, type: "address" };
-          log(`[MainLoop] Using DexScreener token: ${dexTokenAddress}`);
+      // ~1 question in 6 is a general/market one with no specific token —
+      // real chatters don't only ask about single coins.
+      let tokenInfo: QuestionTokenInfo | undefined;
+      if (Math.random() >= 1 / 6) {
+        const candidate = await pickNextToken();
+        if (candidate) {
+          tokenInfo = {
+            identifier: candidate.identifier,
+            type: candidate.type,
+            change24h: candidate.change24h,
+          };
+          rememberToken(candidate.identifier);
         } else {
-          log("[MainLoop] No DexScreener token available, falling back to CoinMarketCap for this turn.");
-          const cmcSymbols = await getTrendingCoinMarketCapSymbols(50);
-          if (cmcSymbols.length > 0) {
-            const symbol = cmcSymbols[Math.floor(Math.random() * cmcSymbols.length)];
-            tokenInfo = { identifier: symbol, type: "ticker" };
-            log(`[MainLoop] Using CoinMarketCap token (fallback): $${symbol}`);
-          }
-        }
-      } else {
-        const cmcSymbols = await getTrendingCoinMarketCapSymbols(50);
-        if (cmcSymbols.length > 0) {
-          const symbol = cmcSymbols[Math.floor(Math.random() * cmcSymbols.length)];
-          tokenInfo = { identifier: symbol, type: "ticker" };
-          log(`[MainLoop] Using CoinMarketCap token: $${symbol}`);
-        } else {
-          log("[MainLoop] No CoinMarketCap symbols available, trying DexScreener as fallback for this turn.");
-          let dexTokenAddress = tokenStoreService.getNextContractAddress();
-          if (dexTokenAddress) {
-            tokenInfo = { identifier: dexTokenAddress, type: "address" };
-            log(`[MainLoop] Using DexScreener token (fallback): ${dexTokenAddress}`);
-          }
+          log("[MainLoop] No token available from any source; asking a general question.");
         }
       }
 
-      // Toggle for next iteration
-      useDexScreenerNext = !useDexScreenerNext;
-
-      // Build question
-      question = await questionService.getFormattedQuestion(tokenInfo);
+      const question = await questionService.getFormattedQuestion(tokenInfo);
 
       if (question && bots.length > 0) {
         const selectedBot = pickNextBot();
