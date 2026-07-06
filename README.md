@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=160&section=header&text=AIR3twitchBot&fontSize=42&fontColor=fff&animation=fadeIn&fontAlignY=38&desc=AIR%C2%B3%20Twitch%20Crypto%20Bot%20is%20a%20TypeScript-based%20Twitch%20bot%20that%20periodically%20a...&descAlignY=60&descSize=14" width="100%"/>
+<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=160&section=header&text=AIR3twitchBot&fontSize=42&fontColor=fff&animation=fadeIn&fontAlignY=38&desc=AIR%C2%B3%20Twitch%20Crypto%20Bot%20is%20a%20TypeScript-based%20Twitch%20bot%20that%20periodically...&descAlignY=60&descSize=14" width="100%"/>
 
 <img src="https://skillicons.dev/icons?i=ts,nodejs&theme=dark" alt="Tech stack"/>
 
